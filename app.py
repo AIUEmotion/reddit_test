@@ -1,29 +1,48 @@
-from flask import Flask, request, jsonify
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return {"message": "Reddit fetch service running!"}
-
-@app.route('/fetch-comments', methods=['POST'])
+@app.route("/fetch-comments", methods=["POST"])
 def fetch_comments():
-    data = request.get_json()
-    reddit_url = data.get('reddit_url')
+    data = request.json
+    reddit_url = data.get("reddit_url")
 
     if not reddit_url:
-        return jsonify({"error": "Missing reddit_url"}), 400
+        return jsonify({"error": "No reddit_url provided"}), 400
 
-    # Reddit APIからコメント取得（簡易例）
-    api_url = reddit_url + ".json"
-    res = requests.get(api_url, headers={'User-agent': 'Mozilla/5.0'})
-    thread_data = res.json()
+    # RedditのURLに .json を強制的に追加
+    if not reddit_url.endswith(".json"):
+        if reddit_url.endswith("/"):
+            reddit_url = reddit_url + ".json"
+        else:
+            reddit_url = reddit_url + "/.json"
 
+    # Reddit API呼び出し（User-Agentを明示）
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; RedditFetcher/1.0)"}
+    res = requests.get(reddit_url, headers=headers)
+
+    # 応答チェック
+    if res.status_code != 200:
+        return jsonify({
+            "error": f"Failed to fetch data from Reddit (status {res.status_code})",
+            "url": reddit_url
+        }), 500
+
+    try:
+        thread_data = res.json()
+    except Exception as e:
+        return jsonify({
+            "error": "Invalid JSON response from Reddit",
+            "details": str(e),
+            "text": res.text[:500]  # デバッグ用に先頭500文字を返す
+        }), 500
+
+    # コメント抽出（サンプル）
     comments = []
-    for c in thread_data[1]["data"]["children"]:
-        body = c["data"].get("body")
-        if body and len(body) < 400:
+    for child in thread_data[1]["data"]["children"]:
+        body = child["data"].get("body")
+        if body:
             comments.append(body)
 
     return jsonify({"comments": comments})
