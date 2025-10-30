@@ -28,8 +28,6 @@ def extract_comments_recursive(comment_obj, comments_list):
                 for reply in reply_children:
                     extract_comments_recursive(reply, comments_list)
                     
-        # "more"タイプは現時点では無視(追加取得が必要になる)
-        
     except Exception as e:
         print(f"Error extracting comment: {e}")
         pass
@@ -43,19 +41,37 @@ def fetch_comments():
     if not reddit_url:
         return jsonify({"error": "No reddit_url provided"}), 400
     
+    # URLをold.reddit.comに変換（403エラー回避）
+    reddit_url = reddit_url.replace("www.reddit.com", "old.reddit.com")
+    reddit_url = reddit_url.replace("reddit.com", "old.reddit.com")
+    
     # URLの正規化
     reddit_url = reddit_url.rstrip('/')
     if not reddit_url.endswith(".json"):
         reddit_url += ".json"
     
-    # より詳細なUser-Agent (Redditは詳細を推奨)
+    # ブラウザを模倣したヘッダー
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Cache-Control": "max-age=0"
     }
     
     try:
-        # タイムアウトを設定
-        res = requests.get(reddit_url, headers=headers, timeout=10)
+        # 少し待機（連続リクエスト回避）
+        time.sleep(0.5)
+        
+        # セッションを使用してクッキーを保持
+        session = requests.Session()
+        res = session.get(reddit_url, headers=headers, timeout=15, allow_redirects=True)
         
         # レート制限のチェック
         if res.status_code == 429:
@@ -63,6 +79,14 @@ def fetch_comments():
                 "error": "Rate limit exceeded. Please try again later.",
                 "status_code": 429
             }), 429
+        
+        if res.status_code == 403:
+            return jsonify({
+                "error": "Access forbidden by Reddit. Try using old.reddit.com URL or wait before retrying.",
+                "status_code": 403,
+                "url": reddit_url,
+                "hint": "Reddit may be blocking automated requests. Consider using Reddit's official API."
+            }), 403
         
         if res.status_code != 200:
             return jsonify({
@@ -85,7 +109,8 @@ def fetch_comments():
     except Exception as e:
         return jsonify({
             "error": "Invalid JSON response from Reddit",
-            "details": str(e)
+            "details": str(e),
+            "content_preview": res.text[:200]
         }), 500
     
     # データ構造の検証
@@ -111,7 +136,8 @@ def fetch_comments():
     
     return jsonify({
         "comments": comments,
-        "total_count": len(comments)
+        "total_count": len(comments),
+        "url_used": reddit_url
     })
 
 
