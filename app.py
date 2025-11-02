@@ -2,6 +2,8 @@ import requests
 from flask import Flask, request, jsonify
 import traceback
 import os
+import base64
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -9,6 +11,48 @@ app = Flask(__name__)
 MAX_COMMENTS = int(os.environ.get("MAX_COMMENTS", 100))
 MIN_SCORE = int(os.environ.get("MIN_SCORE", 5))
 MAX_COMMENT_LENGTH = int(os.environ.get("MAX_COMMENT_LENGTH", 500))
+
+# Reddit API認証情報
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+USE_REDDIT_API = os.environ.get("USE_REDDIT_API", "false").lower() == "true"
+
+# トークンキャッシュ
+_token_cache = {"token": None, "expires_at": None}
+
+def get_reddit_access_token():
+    """Reddit公式APIのアクセストークンを取得"""
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        raise Exception("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set")
+    
+    # キャッシュチェック
+    if _token_cache["token"] and _token_cache["expires_at"]:
+        if datetime.now() < _token_cache["expires_at"]:
+            return _token_cache["token"]
+    
+    # 新規トークン取得
+    auth = base64.b64encode(f"{REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "User-Agent": "VideoBot/1.0"
+    }
+    data = {"grant_type": "client_credentials"}
+    
+    res = requests.post("https://www.reddit.com/api/v1/access_token", 
+                       headers=headers, data=data, timeout=10)
+    
+    if res.status_code != 200:
+        raise Exception(f"Failed to get Reddit token: {res.status_code} - {res.text}")
+    
+    token_data = res.json()
+    token = token_data["access_token"]
+    expires_in = token_data.get("expires_in", 3600)
+    
+    # キャッシュ
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = datetime.now() + timedelta(seconds=expires_in - 300)
+    
+    return token
 
 def extract_comments_recursive(comment_obj, comments_list, depth=0, max_depth=10):
     """再帰的にコメントを抽出"""
@@ -96,62 +140,134 @@ def fetch_comments():
         
         app.logger.info(f"Processing URL: {reddit_url}")
         
-        # URLをold.reddit.comに変換（403エラー回避）
-        original_url = reddit_url
-        reddit_url = reddit_url.replace("www.reddit.com", "old.reddit.com")
-        if "reddit.com" in reddit_url and "old.reddit.com" not in reddit_url:
-            reddit_url = reddit_url.replace("reddit.com", "old.reddit.com")
-        
-        # .jsonを追加
-        reddit_url = reddit_url.rstrip('/')
-        if not reddit_url.endswith(".json"):
-            reddit_url += ".json"
-        
-        app.logger.info(f"Fetching from: {reddit_url}")
-        
-        # Redditにリクエスト
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/html",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://www.google.com/",
-            "DNT": "1",
-            "Connection": "keep-alive"
-        }
-        
-        res = requests.get(reddit_url, headers=headers, timeout=15, allow_redirects=True)
-        
-        # エラーハンドリング
-        if res.status_code == 403:
-            return jsonify({
-                "error": "Access forbidden by Reddit",
-                "status_code": 403,
-                "hint": "Reddit is blocking automated requests. This happens sometimes. Try:\n1. Wait a few minutes and retry\n2. Use a different network\n3. Consider using Reddit API with authentication"
-            }), 403
-        
-        if res.status_code == 404:
-            return jsonify({
-                "error": "Reddit post not found",
-                "status_code": 404,
-                "url": original_url
-            }), 404
-        
-        if res.status_code != 200:
-            return jsonify({
-                "error": f"Reddit returned status {res.status_code}",
-                "status_code": res.status_code,
-                "url": reddit_url
-            }), res.status_code
-        
-        # JSONパース
+        # URLからpost_idを抽出
         try:
-            thread_data = res.json()
+            parts = reddit_url.split("/comments/")
+            if len(parts) < 2:
+                raise ValueError("Invalid URL format")
+            post_id = parts[1].split("/")[0]
         except Exception as e:
             return jsonify({
-                "error": "Invalid JSON response from Reddit",
+                "error": "Failed to extract post_id from URL",
                 "details": str(e)
-            }), 500
+            }), 400
+        
+        app.logger.info(f"Post ID: {post_id}")
+        
+        # Reddit API使用判定
+        use_api = USE_REDDIT_API or (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET)
+        
+        if use_api:
+            app.logger.info("Using Reddit Official API")
+            try:
+                # 公式API経由で取得
+                access_token = get_reddit_access_token()
+                api_url = f"https://oauth.reddit.com/comments/{post_id}"
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": "VideoBot/1.0"
+                }
+                res = requests.get(api_url, headers=headers, timeout=15)
+                
+                if res.status_code != 200:
+                    raise Exception(f"Reddit API returned {res.status_code}")
+                    
+                thread_data = res.json()
+                
+            except Exception as api_error:
+                app.logger.error(f"Reddit API failed: {str(api_error)}")
+                return jsonify({
+                    "error": "Reddit API authentication failed",
+                    "details": str(api_error),
+                    "hint": "Check REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET"
+                }), 500
+        else:
+            app.logger.info("Using old.reddit.com JSON (no authentication)")
+            
+            # URLをold.reddit.comに変換
+            original_url = reddit_url
+            reddit_url = reddit_url.replace("www.reddit.com", "old.reddit.com")
+            if "reddit.com" in reddit_url and "old.reddit.com" not in reddit_url:
+                reddit_url = reddit_url.replace("reddit.com", "old.reddit.com")
+            
+            # .jsonを追加
+            reddit_url = reddit_url.rstrip('/')
+            if not reddit_url.endswith(".json"):
+                reddit_url += ".json"
+            
+            app.logger.info(f"Fetching from: {reddit_url}")
+        
+            # 複数のUser-Agentをローテーション
+            import random
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ]
+            
+            headers = {
+                "User-Agent": random.choice(user_agents),
+                "Accept": "application/json, text/html",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://www.google.com/",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Cache-Control": "max-age=0"
+            }
+            
+            # リトライ付きリクエスト
+            import time
+            max_retries = 3
+            retry_delay = 2
+            
+            for attempt in range(max_retries):
+                try:
+                    app.logger.info(f"Attempt {attempt + 1}/{max_retries}")
+                    
+                    if attempt > 0:
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    
+                    res = requests.get(reddit_url, headers=headers, timeout=15, allow_redirects=True)
+                    
+                    if res.status_code == 200:
+                        break
+                        
+                    if res.status_code != 403:
+                        break
+                        
+                    app.logger.warning(f"Got 403, retrying... ({attempt + 1}/{max_retries})")
+                    
+                except requests.exceptions.RequestException as e:
+                    app.logger.error(f"Request failed: {str(e)}")
+                    if attempt == max_retries - 1:
+                        raise
+            
+            # エラーチェック
+            if res.status_code == 403:
+                return jsonify({
+                    "error": "Access forbidden by Reddit after retries",
+                    "status_code": 403,
+                    "hint": "Set environment variables REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to use Reddit API authentication",
+                    "tried_url": reddit_url
+                }), 403
+            
+            if res.status_code != 200:
+                return jsonify({
+                    "error": f"Reddit returned status {res.status_code}",
+                    "status_code": res.status_code,
+                    "url": reddit_url
+                }), res.status_code
+            
+            # JSONパース
+            try:
+                thread_data = res.json()
+            except Exception as e:
+                return jsonify({
+                    "error": "Invalid JSON response from Reddit",
+                    "details": str(e)
+                }), 500
         
         # データ検証
         if not isinstance(thread_data, list) or len(thread_data) < 2:
@@ -167,7 +283,7 @@ def fetch_comments():
             post_author = post_data.get('author', '')
             post_score = post_data.get('score', 0)
             post_created = post_data.get('created_utc', 0)
-            post_url = original_url.replace('.json', '')
+            post_url = reddit_url if not use_api else f"https://reddit.com/comments/{post_id}"
         except (KeyError, IndexError) as e:
             return jsonify({
                 "error": "Failed to extract post information",
