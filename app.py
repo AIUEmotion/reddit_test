@@ -283,6 +283,10 @@ def fetch_comments():
             post_author = post_data.get('author', '')
             post_score = post_data.get('score', 0)
             post_created = post_data.get('created_utc', 0)
+            post_selftext = post_data.get('selftext', '')  # 投稿本文
+            post_url_original = post_data.get('url', '')  # 元のURL（動画やニュース記事）
+            post_domain = post_data.get('domain', '')  # ドメイン（youtube.com など）
+            post_is_video = post_data.get('is_video', False)  # 動画投稿か
             post_url = reddit_url if not use_api else f"https://reddit.com/comments/{post_id}"
         except (KeyError, IndexError) as e:
             return jsonify({
@@ -348,6 +352,20 @@ def fetch_comments():
             f"{c['body']}"
             for i, c in enumerate(top_comments)
         ])
+        
+        # 投稿本文をプロンプト用に整形
+        post_context = f"""
+【投稿タイトル】
+{post_title}
+
+【投稿本文】
+{post_selftext if post_selftext else '（本文なし）'}
+
+【元の情報源】
+URL: {post_url_original}
+ドメイン: {post_domain}
+動画投稿: {'はい' if post_is_video else 'いいえ'}
+""".strip()
         
         # レスポンス
         return jsonify({
